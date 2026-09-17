@@ -19,6 +19,7 @@ services:
       RESTRICT_SLA_SECONDS: "8"
       PURGE_SLA_SECONDS: "8"
       REQUEST_TTL_SECONDS: "120"
+      POLICY_URL: http://policy:9104
       SERVICES_JSON: |
         [
           {"name": "orders",  "base_url": "http://orders:9101"},
@@ -29,12 +30,29 @@ services:
       - "8080:8080"
     volumes:
       - coord-data:/data
+    # 迁移崩溃注入杀死协调端后由编排自动重启：重启进程凭持久检查点完成迁移
+    restart: unless-stopped
+    depends_on:
+      - policy
     healthcheck:
       test: ["CMD", "python3", "-c",
              "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=3).status==200 else 1)"]
       interval: 3s
       timeout: 3s
       retries: 20
+
+  # 合规策略控制平面：版本化 legal-hold / fiscal-retention 规则的
+  # draft / canary / activate / rollback，协调端为每个工作流绑定不可变修订。
+  policy:
+    image: deletion-coordinator:local
+    command: ["python3", "-m", "services.policy_service"]
+    environment:
+      POLICY_PORT: "9104"
+      POLICY_DB: /data/policy.db
+      INTERNAL_TOKEN: dev-internal-token
+      ADMIN_TOKEN: dev-admin-token
+    volumes:
+      - policy-data:/data
 
   orders:
     image: deletion-coordinator:local
@@ -81,13 +99,15 @@ services:
       - profile-data:/data
 
   # 独立验证容器：不挂载任何内部数据卷，仅通过对外/内部 API 黑盒证明。
-  # 退出码 0 = 启动验证通过。
+  # 退出码 0 = 启动验证通过。崩溃恢复场景 G 依赖 coordinator 的 restart 策略。
   verifier:
     image: deletion-coordinator:local
     command: ["python3", "-m", "tests.verifier"]
     depends_on:
       coordinator:
         condition: service_healthy
+      policy:
+        condition: service_started
       orders:
         condition: service_started
       billing:
@@ -99,14 +119,17 @@ services:
       ORDERS_URL: http://orders:9101
       BILLING_URL: http://billing:9101
       PROFILE_URL: http://profile:9101
+      POLICY_URL: http://policy:9104
       INTERNAL_TOKEN: dev-internal-token
       ADMIN_TOKEN: dev-admin-token
       DELETION_SIGNING_SECRET: dev-deletion-secret
       GLOBAL_TOMBSTONE_SECRET: dev-tombstone-secret
+      COORD_RESTART_GRACE: "3"
     restart: ""
 
 volumes:
   coord-data:
+  policy-data:
   orders-data:
   billing-data:
   profile-data:

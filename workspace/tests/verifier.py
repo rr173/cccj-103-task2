@@ -8,6 +8,10 @@
      重复/乱序回报被识别；对外确认后迟到副本被墓碑拦截，不复活。
   B. 服务长期失联（故障注入）：期限到期 overdue；安全重试；恢复后收敛确认。
   C. Saga 永久失败：局部补偿 UNRESTRICT 后 ABORTED；不发证书；无墓碑。
+  D~H（tests/policy_scenarios.py）：版本化合规策略控制平面——
+     金丝雀/对照分流、新匹配先封存、撤回续跑、迁移与迟到 PURGED 竞争收敛、
+     重放幂等、expected-version 冲突原子不改动、崩溃检查点续跑、
+     部分金丝雀回滚保留历史墓碑/证书且外部认证不可改写。
 退出码：0 全部通过；1 有断言失败。
 """
 from __future__ import annotations
@@ -25,6 +29,7 @@ COORD = os.environ.get("COORD_URL", "http://127.0.0.1:8080")
 ORDERS = os.environ.get("ORDERS_URL", "http://127.0.0.1:9101")
 BILLING = os.environ.get("BILLING_URL", "http://127.0.0.1:9102")
 PROFILE = os.environ.get("PROFILE_URL", "http://127.0.0.1:9103")
+POLICY = os.environ.get("POLICY_URL", "http://127.0.0.1:9104")
 INTERNAL_TOKEN = os.environ.get("INTERNAL_TOKEN", "dev-internal-token")
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "dev-admin-token")
 SECRET = os.environ.get("DELETION_SIGNING_SECRET", "dev-deletion-secret").encode()
@@ -116,6 +121,7 @@ def leaf_hash(item: dict) -> str:
         "hold_code": item["hold_code"],
         "command_id": item["command_id_purge"] or item["command_id_restrict"],
         "updated_at": item["updated_at"],
+        "policy_revision": item.get("policy_revision"),
     }))
 
 
@@ -145,24 +151,41 @@ def get_raw(rid: str) -> dict:
 
 
 def verify_certificate_strict(rid: str) -> bool:
-    """严格独立验证：叶子哈希 -> Merkle 根 -> HMAC 签名，全部从零复算。"""
+    """严格独立验证：叶子哈希 -> Merkle 根 -> HMAC 签名，全部从零复算。
+
+    叶子以证书签发时落库的规范字段（leaf["body"]）为准：即便条目之后因策略
+    迁移/续跑而变化，历史证书仍可被第三方独立复验（回滚不重写历史证据）。
+    所有历史版本证书逐一验证。
+    """
     raw = get_raw(rid)
-    cert = raw["certificates"][-1]
-    leaves = []
-    for it in raw["items"]:
-        if it["status"] == "CANCELLED":
-            continue
-        leaves.append(leaf_hash(it))
-    if merkle(leaves) != cert["merkle_root"]:
+    if not raw["certificates"]:
         return False
-    payload = {
-        "request_id": rid, "subject_id": raw["subject_id"],
-        "version": cert["version"], "merkle_root": cert["merkle_root"],
-        "issued_at": cert["created_at"],
-        "sealed_count": cert["sealed_count"], "item_count": cert["item_count"],
-    }
-    sig = hmac.new(SECRET, canon(payload), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(sig, cert["signature"])
+    ok = True
+    for cert in raw["certificates"]:
+        leaves = []
+        for l in cert["leaves"]:
+            body = l.get("body")
+            if not body:
+                ok = False
+                continue
+            # 1a) 叶子哈希可由其随证保存的规范字段独立复算（防篡改）
+            if sha(canon(body)) != l["hash"]:
+                ok = False
+            leaves.append(l["hash"])
+        # 1b) 叶子成对折叠为 Merkle 根
+        if merkle(leaves) != cert["merkle_root"]:
+            ok = False
+        # 2) 协调端 HMAC 签名
+        payload = {
+            "request_id": rid, "subject_id": raw["subject_id"],
+            "version": cert["version"], "merkle_root": cert["merkle_root"],
+            "issued_at": cert["created_at"],
+            "sealed_count": cert["sealed_count"], "item_count": cert["item_count"],
+        }
+        sig = hmac.new(SECRET, canon(payload), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, cert["signature"]):
+            ok = False
+    return ok
 
 
 def tombstone_token(request_id: str, subject_id: str) -> str:
@@ -424,21 +447,33 @@ def scenario_c():
 
 def main():
     print("等待服务就绪 ...")
-    for url, name in ((COORD, "coordinator"), (ORDERS, "orders"),
-                      (BILLING, "billing"), (PROFILE, "profile")):
+    for url, name in ((COORD, "coordinator"), (POLICY, "policy"),
+                      (ORDERS, "orders"), (BILLING, "billing"),
+                      (PROFILE, "profile")):
         if not wait_for(url, name):
             print(f"FATAL: {name} 未就绪")
             sys.exit(1)
 
     # 健康检查
-    for url, name in ((COORD, "coordinator"), (ORDERS, "orders"),
-                      (BILLING, "billing"), (PROFILE, "profile")):
+    for url, name in ((COORD, "coordinator"), (POLICY, "policy"),
+                      (ORDERS, "orders"), (BILLING, "billing"),
+                      (PROFILE, "profile")):
         s, b = req("GET", f"{url}/health")
         check(f"health {name}", s == 200 and b.get("ok"), str(b))
+
+    # 策略组件基线：存在且仅有一份 ACTIVE 空规则基线修订 rev1
+    s, b = req("GET", f"{POLICY}/policies/active", token=INTERNAL_TOKEN)
+    check("policy 基线修订 rev1 已激活", s == 200 and b.get("revision") == 1
+          and b.get("state") == "ACTIVE" and b.get("rules") == [], str(b))
 
     scenario_a()
     scenario_b()
     scenario_c()
+
+    # 版本化合规策略控制平面验收场景 D~H（policy/coordinator/mock backends/
+    # 外部独立验证方共同参与）
+    from tests import policy_scenarios
+    policy_scenarios.run_policy_scenarios(check)
 
     print("\n================ 验证结果 ================")
     print(f"通过 {len(PASSES)} 项，失败 {len(FAILURES)} 项")

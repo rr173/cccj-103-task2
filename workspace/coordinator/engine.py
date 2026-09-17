@@ -22,13 +22,14 @@ import threading
 import time
 import uuid
 
-from . import http_client
+from . import http_client, policy_client
 from .store import SEALED_LIKE, STATUS_RANK, TERMINAL, Store
 from common import (
     evidence_leaf,
     iso,
     merkle_root,
     now_ms,
+    seal_rule_for,
     sign,
     tombstone_token,
 )
@@ -74,7 +75,16 @@ class Engine:
         self.callback_base = callback_base.rstrip("/")
         self._stop = threading.Event()
         self._pause_after_resolve: set[str] = set()
+        # 已应用/在途修订的规则快照缓存：迁移把条目换绑后，RESTRICT 重发需用其修订
+        self._rev_rules: dict[int, list[dict]] = {}
+        # 崩溃注入：本次运行处理完第 N 个迁移项后在检查点落盘后退出；
+        # 重启的进程默认为 0（不持久化），从而从持久检查点恢复完成迁移。
+        # 经 POST /admin/policy/crash-after 在运行时武装（仅进程内存）。
+        self._crash_after = 0
         self.thread: threading.Thread | None = None
+
+    def set_migration_crash_after(self, n: int):
+        self._crash_after = max(0, int(n))
 
     # -- 生命周期 ----------------------------------------------------------
     def start(self):
@@ -99,30 +109,43 @@ class Engine:
         ts = now_ms()
         if pause_after_resolve:
             self._pause_after_resolve.add(rid)
+        # 每个工作流在创建时绑定一个不可变的策略修订快照：
+        # 金丝雀主体命中 CANARIED 修订，其余主体命中 ACTIVE 修订。
+        snap = policy_client.resolve_subject(subject_id)
+        revision = int(snap["revision"])
+        rules = snap.get("rules", [])
         with self.store.lock:
             self.store.conn.execute(
                 "INSERT INTO requests(id, subject_id, display_name, status, deadline_ms,"
-                " created_at, updated_at) VALUES(?,?,?,?,?,?,?)",
-                (rid, subject_id, display_name, "RESOLVING", ts + REQUEST_TTL_MS, ts, ts),
-            )
+                " created_at, updated_at, policy_revision)"
+                " VALUES(?,?,?,?,?,?,?,?)",
+                (rid, subject_id, display_name, "RESOLVING", ts + REQUEST_TTL_MS,
+                 ts, ts, revision))
+            self.store.put_binding(rid, subject_id, revision, rules,
+                                   snap.get("content_hash"),
+                                   bool(snap.get("canary")))
             for svc in self.registry:
                 iid = f"{rid}:{svc}:PENDING"
                 self.store.conn.execute(
                     "INSERT INTO items(id, request_id, service, subject_id, status,"
-                    " next_attempt_at, created_at, updated_at)"
-                    " VALUES(?,?,?,?,?,?,?,?)",
-                    (iid, rid, svc, subject_id, "PENDING", ts, ts, ts),
-                )
+                    " next_attempt_at, created_at, updated_at, policy_revision,"
+                    " policy_version) VALUES(?,?,?,?,?,?,?,?,?,1)",
+                    (iid, rid, svc, subject_id, "PENDING", ts, ts, ts, revision))
             self.store.event(rid, "REQUEST_CREATED", {
                 "subject_id": subject_id, "display_name": display_name,
                 "deadline": iso(ts + REQUEST_TTL_MS),
                 "services": list(self.registry),
-            })
+                "policy_revision": revision, "canary": bool(snap.get("canary"))})
             self.store.commit()
         return self.store.get_request(rid)
 
     # -- 主循环 ------------------------------------------------------------
     def tick(self):
+        # 先恢复/推进在途策略迁移：崩溃重启后仅凭持久登记即可从检查点续跑
+        try:
+            self._process_migrations()
+        except Exception as e:
+            print(f"[engine] migration tick error: {e!r}")
         for req in self.store.active_requests():
             rid = req["id"]
             if req["engine_paused"]:
@@ -220,10 +243,12 @@ class Engine:
                         self.store.conn.execute(
                             "INSERT INTO items(id, request_id, service, subject_id,"
                             " record_id, status, command_id_restrict, next_attempt_at,"
-                            " created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                            " created_at, updated_at, policy_revision, policy_version)"
+                            " VALUES(?,?,?,?,?,?,?,?,?,?,?,1)",
                             (nid, rid, item["service"], item["subject_id"],
                              rec["record_id"], "PENDING",
-                             f"cmd_{uuid.uuid4().hex[:12]}", ts, ts, ts))
+                             f"cmd_{uuid.uuid4().hex[:12]}", ts, ts, ts,
+                             item.get("policy_revision", 1)))
                     self.store.event(rid, "IDENTITY_RESOLVED", {
                         "service": item["service"], "records": records})
                 # 关键：解析结果立即提交，后续 tick 才能看到真实计划项
@@ -248,6 +273,7 @@ class Engine:
                 continue
             svc = self.registry.get(item["service"])
             command_id = item["command_id_restrict"] or f"cmd_{uuid.uuid4().hex[:12]}"
+            rules = self._rules_for_revision(item["policy_revision"], rid)
             payload = {
                 "command_id": command_id,
                 "request_id": rid,
@@ -255,6 +281,9 @@ class Engine:
                 "record_id": item["record_id"],
                 "op": "RESTRICT",
                 "callback_url": f"{self.callback_base}/internal/reports",
+                # 命令携带条目所绑定的不可变策略快照：金丝雀/对照主体分流
+                "policy_revision": item["policy_revision"],
+                "rules": rules,
             }
             try:
                 status, body = http_client.post(
@@ -305,14 +334,20 @@ class Engine:
                     "UPDATE items SET holds_checked_at=? WHERE id=?", (ts, item["id"]))
                 active = body.get("active")
                 releases_at = body.get("releases_at")
-                if not active:
+                origin = body.get("origin")
+                # 仅服务侧 LOCAL 固定保留到期自动解除；
+                # POLICY 保留必须由显式策略迁移（RELEASE_HOLD）撤回，
+                # EXTERNAL（外部认证）保留任何路径都不得解除。
+                if not active and origin in (None, "LOCAL"):
                     # 保留解除：同一计划项回到 RESTRICTED，等待 PURGE 闸门
                     self.store.conn.execute(
                         "UPDATE items SET status='RESTRICTED', hold_code=NULL,"
-                        " hold_reason=NULL, hold_releases_at=NULL, updated_at=? WHERE id=?",
+                        " hold_reason=NULL, hold_releases_at=NULL, hold_origin=NULL,"
+                        " updated_at=? WHERE id=?",
                         (ts, item["id"]))
                     self.store.event(rid, "HOLD_RELEASED", {
                         "service": item["service"], "record_id": item["record_id"],
+                        "origin": origin,
                         "note": "约束解除，自动续跑原计划，无需重新申请"})
                 elif releases_at and releases_at != item["hold_releases_at"]:
                     self.store.conn.execute(
@@ -361,6 +396,7 @@ class Engine:
                 "record_id": item["record_id"],
                 "op": "PURGE",
                 "callback_url": f"{self.callback_base}/internal/reports",
+                "policy_revision": item["policy_revision"],
             }
             try:
                 status, body = http_client.post(
@@ -480,10 +516,15 @@ class Engine:
                 "command_id": item.get("command_id_purge")
                              or item.get("command_id_restrict"),
                 "updated_at": item["updated_at"],
+                # 证据绑定策略修订：证书签发时该项所处的不可变策略版本
+                "policy_revision": item.get("policy_revision"),
             }
+            # 叶子携带完整规范字段：历史证书在条目后续迁移后仍可独立复验，
+            # 而不依赖会变化的当前 items 行。
             leaves.append({"item": f"{item['service']}:{item.get('record_id')}",
                            "status": item["status"],
-                           "hash": evidence_leaf(leaf_body)})
+                           "hash": evidence_leaf(leaf_body),
+                           "body": leaf_body})
             if item["status"] == "SEALED":
                 sealed += 1
         root = merkle_root([l["hash"] for l in leaves])
@@ -573,21 +614,51 @@ class Engine:
         if item["active_command_id"]:
             valid_cmds.add(item["active_command_id"])
         valid_cmds.discard(None)
+        is_migration_cmd = bool(command_id) and str(command_id).startswith(
+            ("cmd_seal_", "cmd_release_"))
         if command_id and command_id not in valid_cmds \
-                and not str(command_id).startswith("cmd_comp_"):
+                and not str(command_id).startswith("cmd_comp_") \
+                and not is_migration_cmd:
             return self._record_report(rid, service, record_id, command_id, payload,
                                        False, "stale/unknown command_id")
+        # 乐观并发（修订围栏）：竞争回调不得把同一条目推进到两个修订之下。
+        # 命令携带的 policy_revision 与条目当前绑定不一致时一律拒绝（不改状态）。
+        cmd_revision = payload.get("policy_revision")
+        if cmd_revision is not None and int(cmd_revision) != \
+                int(item.get("policy_revision") or 0):
+            return self._record_report(rid, service, record_id, command_id, payload,
+                                       False,
+                                       f"revision fence: item bound to"
+                                       f" rev {item.get('policy_revision')},"
+                                       f" callback rev {cmd_revision}")
         # 阶段-状态必须匹配：RESTRICT 阶段命令只能报 RESTRICTED/SEALED/FAILED，
         # PURGE 阶段命令只能报 PURGED/FAILED。用 restrict 命令报 PURGED 属于越级。
         phase_status = {
             item["command_id_restrict"]: {"RESTRICTED", "SEALED", "FAILED"},
             item["command_id_purge"]: {"PURGED", "FAILED"},
         }.get(command_id)
+        if str(command_id).startswith("cmd_seal_"):
+            phase_status = {"SEALED", "PURGED", "FAILED"}
+        elif str(command_id).startswith("cmd_release_"):
+            phase_status = {"RESTRICTED", "SEALED", "PURGED", "FAILED"}
         if phase_status and reported not in phase_status:
             return self._record_report(rid, service, record_id, command_id, payload,
                                        False,
-                                               f"phase/status mismatch: {command_id[:8]}"
+                                               f"phase/status mismatch: {command_id[:12]}"
                                                f" cannot report {reported}")
+        # 关键护栏：迁移封存后迟到的旧 PURGE 回调不得把 SEALED 推进为 PURGED。
+        if item["status"] == "SEALED" and reported == "PURGED":
+            return self._record_report(rid, service, record_id, command_id, payload,
+                                       False,
+                                       "rejected: SEALED item cannot be purged"
+                                       " (withdraw/rollback first)")
+        # 迁移命令同步执行；其迟到的 FAILED 回调不得把已封存项降为 FAILED
+        if item["status"] == "SEALED" and reported == "FAILED" \
+                and is_migration_cmd:
+            return self._record_report(rid, service, record_id, command_id, payload,
+                                       False,
+                                       "rejected: late migration FAILED cannot"
+                                       " rewrite SEALED history")
         # 终态后重复回报：幂等接受（不改变状态），明确标注 duplicate
         if item["status"] in TERMINAL and reported == item["status"]:
             self._record_report(rid, service, record_id, command_id, payload,
@@ -633,9 +704,15 @@ class Engine:
             vals: list = [status, body.get("result_hash"),
                           json.dumps(body, ensure_ascii=False, sort_keys=True), ts]
             if status == "SEALED":
-                fields += ["hold_code=?", "hold_reason=?", "hold_releases_at=?"]
+                fields += ["hold_code=?", "hold_reason=?", "hold_releases_at=?",
+                           "hold_origin=?"]
                 vals += [body.get("hold_code"), body.get("hold_reason"),
-                         body.get("hold_releases_at")]
+                         body.get("hold_releases_at"),
+                         body.get("hold_origin", "POLICY")]
+            else:
+                # RESTRICTED（保留解除/迁移撤回）：清空封存字段，回到可擦除冻结态
+                fields += ["hold_code=NULL", "hold_reason=NULL",
+                           "hold_releases_at=NULL", "hold_origin=NULL"]
             if status == "FAILED":
                 fields += ["fatal=1"]
             vals.append(iid)
@@ -666,6 +743,19 @@ class Engine:
         ts = now_ms()
         fatal = e.status in (400, 404, 409)
         with self.store.lock:
+            cur = self.store.get_item(item["id"])
+            # 封存项的 PURGE 被服务以"保留仍有效"拒绝：保持 SEALED 终态口径，
+            # 绝不标记 FAILED；保留解除（迁移 RELEASE / 到期）后闸门会重开。
+            if phase == "purge" and cur and cur["status"] == "SEALED":
+                self.store.conn.execute(
+                    "UPDATE items SET last_error=?, next_attempt_at=0,"
+                    " updated_at=? WHERE id=?",
+                    (f"purge blocked while sealed: {e.body}", ts, item["id"]))
+                self.store.event(item["request_id"], "PURGE_BLOCKED_BY_HOLD", {
+                    "service": item["service"], "record_id": item["record_id"],
+                    "error": str(e.body)[:200]})
+                self.store.commit()
+                return
             if fatal:
                 self.store.conn.execute(
                     "UPDATE items SET status='FAILED', fatal=1, last_error=?,"
@@ -712,3 +802,566 @@ class Engine:
                 "UPDATE requests SET status=?, updated_at=? WHERE id=?",
                 (status, now_ms(), rid))
             self.store.commit()
+
+    # =====================================================================
+    # 合规策略控制平面：不可变修订绑定 / 干跑 / 幂等可恢复迁移 / 回滚
+    # =====================================================================
+    def _rules_for_revision(self, revision: int, rid: str | None = None):
+        """取得某修订号对应的不可变规则快照（缓存优先，缺失则问策略组件）。"""
+        if revision in self._rev_rules:
+            return self._rev_rules[revision]
+        binding = self.store.get_binding(rid) if rid else None
+        if binding and int(binding["revision"]) == int(revision):
+            self._rev_rules[revision] = binding["rules"]
+            return binding["rules"]
+        try:
+            rev = policy_client.get_revision(int(revision))
+            self._rev_rules[revision] = rev.get("rules", [])
+            return rev.get("rules", [])
+        except policy_client.PolicyError:
+            # 策略组件暂不可达：不编造规则，退化为空（既有 LOCAL 保留仍然生效）
+            return []
+
+    @staticmethod
+    def _migration_id(revision: int, mode: str, subjects: list[str] | None,
+                      expected_version: int | None = None) -> str:
+        if subjects is None:
+            scope = "ALL"
+        else:
+            scope = ",".join(sorted(set(subjects)))
+        # expected_version 进入幂等键：冲突请求（CONFLICT 行）作为审计保留后，
+        # 运营以正确期望版本重试会得到一次全新的评估，而不会被旧冲突行遮蔽。
+        exp = "na" if expected_version is None else str(expected_version)
+        return f"mig_r{revision}_{mode}_{scope or 'EMPTY'}_exp{exp}"
+
+    def _migration_snapshot(self, revision: int) -> dict:
+        rev = policy_client.get_revision(revision)
+        if not rev or rev.get("state") not in ("CANARIED", "ACTIVE"):
+            raise PolicyApplyError(
+                f"revision {revision} is not CANARIED/ACTIVE",
+                {"revision": revision, "state": (rev or {}).get("state")})
+        return rev
+
+    def _plan_item_action(self, item: dict, rules: list[dict], target: int) -> str:
+        """计算单个计划项在目标修订下的动作（纯函数，干跑与迁移共用）。"""
+        status = item["status"]
+        if status == "CANCELLED":
+            return "SKIP"
+        # PURGED / FAILED：法律终态，任何迁移不得改写；ABORTED 在请求层排除。
+        if status in ("PURGED", "FAILED"):
+            return "SKIP"
+        # 外部认证封存：任何策略迁移都不得解除或改版本
+        if status == "SEALED" and item.get("hold_origin") == "EXTERNAL":
+            return "SKIP"
+        if status == "PURGING":
+            return "WAIT"
+        seal = seal_rule_for(rules, service=item["service"],
+                             subject_id=item["subject_id"],
+                             record_id=item["record_id"])
+        if status == "SEALED":
+            # 本地固定保留：等待其自身到期续跑，不被策略迁移改写
+            if item.get("hold_origin") == "LOCAL":
+                return "SKIP"
+            # 策略封存：新修订仍要求封存 -> 保持封存并换绑；否则撤回 -> 解封续跑
+            return "SEAL" if seal else "RELEASE"
+        # RESTRICTED / PENDING / DISPATCHED / ERROR
+        if seal:
+            return "SEAL"
+        return "REBIND"
+
+    def policy_dry_run(self, revision: int, subjects: list[str] | None) -> dict:
+        """干跑：报告候选修订将对哪些未完成条目产生变更（不落库、不发命令）。"""
+        rev = self._migration_snapshot(revision)
+        rules = rev["rules"]
+        changes, skipped, waiting = [], [], []
+        with self.store.lock:
+            rows = self.store.conn.execute(
+                "SELECT * FROM requests WHERE status IN ('RESOLVING','IN_PROGRESS','CONFIRMED')"
+            ).fetchall()
+            for r in rows:
+                req = dict(r)
+                if subjects is not None and req["subject_id"] not in subjects:
+                    continue
+                if int(req["policy_revision"]) == revision:
+                    continue
+                for item in self.store.list_items(req["id"]):
+                    if item["record_id"] is None:
+                        continue  # 身份解析前的占位项：不属于迁移对象
+                    if item["status"] == "CANCELLED":
+                        continue
+                    action = self._plan_item_action(item, rules, revision)
+                    entry = {
+                        "request_id": req["id"],
+                        "subject_id": req["subject_id"],
+                        "service": item["service"],
+                        "record_id": item["record_id"],
+                        "from_status": item["status"],
+                        "bound_revision": item["policy_revision"],
+                        "action": action,
+                    }
+                    if action == "SKIP":
+                        skipped.append({**entry,
+                                        "reason": self._skip_reason(item)})
+                    elif action == "WAIT":
+                        waiting.append(entry)
+                    else:
+                        changes.append(entry)
+        return {"revision": revision, "state": rev["state"],
+                "content_hash": rev["content_hash"],
+                "would_change": len(changes),
+                "changes": changes, "waiting": waiting, "skipped": skipped}
+
+    @staticmethod
+    def _skip_reason(item: dict) -> str:
+        if item["status"] in ("PURGED", "FAILED"):
+            return "legal terminal state is immutable"
+        if item["status"] == "SEALED" and item.get("hold_origin") == "EXTERNAL":
+            return "externally certified history cannot be rewritten"
+        if item["status"] == "SEALED" and item.get("hold_origin") == "LOCAL":
+            return "local fixed-term hold; resumes on its own release"
+        return "no change"
+
+    def apply_policy_revision(self, revision: int, mode: str,
+                              subjects: list[str] | None,
+                              expected_version: int | None,
+                              from_revision: int | None = None) -> dict:
+        """登记并（由引擎循环）执行一次策略迁移。
+
+        幂等：同一 (revision, mode, subjects) 重放返回既有登记，不产生额外
+        事件/命令/修订号跳动。冲突时所有条目保持原样（仅留一条冲突诊断记录）。
+
+        from_revision 仅 rollback 使用：只把当前绑定在"被撤回修订"上的条目
+        迁回恢复修订，其余条目（更早的历史修订）一概不动。
+        """
+        mid = self._migration_id(revision, mode, subjects, expected_version)
+        with self.store.lock:
+            existing = self.store.get_migration(mid)
+            if existing:
+                return {"idempotent": True, **self.store.migration_view(mid)}
+            try:
+                rev = self._migration_snapshot(revision)
+                active = policy_client.get_active()
+                active_n = int(active["revision"])
+                # 乐观并发：期望版本不符 -> 诊断性 409，原子地不触碰任何条目
+                conflict = None
+                if expected_version is not None and \
+                        int(expected_version) != active_n:
+                    conflict = (f"expected active policy version {expected_version}"
+                                f" but policy component reports {active_n}")
+                elif mode == "canary":
+                    cohort = set(rev.get("canary_subjects", []))
+                    if rev["state"] != "CANARIED":
+                        conflict = (f"revision {revision} is {rev['state']},"
+                                    " cannot canary-apply")
+                    elif subjects and not set(subjects) <= cohort:
+                        conflict = ("canary subjects outside registered cohort:"
+                                    f" {sorted(set(subjects or []) - cohort)}")
+                if conflict:
+                    ts = now_ms()
+                    self.store.conn.execute(
+                        "INSERT INTO policy_migrations(id, revision, mode,"
+                        " expected_version, state, total, done, last_item_id,"
+                        " detail, created_at, updated_at)"
+                        " VALUES(?,?,?,?, 'CONFLICT', 0, 0, NULL, ?, ?, ?)",
+                        (mid, revision, mode, expected_version,
+                         json.dumps({"error": conflict, "active": active_n}),
+                         ts, ts))
+                    self.store.migration_event(mid, "MIGRATION_CONFLICT", {
+                        "error": conflict, "expected": expected_version,
+                        "actual": active_n})
+                    self.store.commit()
+                    raise PolicyApplyError(conflict, {
+                        "migration_id": mid, "expected": expected_version,
+                        "actual": active_n, "revision": revision})
+            except policy_client.PolicyError as e:
+                raise PolicyApplyError(f"policy component error: {e.body}",
+                                       {"revision": revision})
+
+            # 预检 + 计划（同一事务/锁内，冲突后此处绝不执行 => 全部条目不动）
+            plan = self._build_plan(revision, mode, subjects, rev["rules"],
+                                    from_revision)
+            ts = now_ms()
+            self.store.conn.execute(
+                "INSERT INTO policy_migrations(id, revision, mode, expected_version,"
+                " state, total, done, last_item_id, detail, created_at, updated_at)"
+                " VALUES(?,?,?,?,'IN_PROGRESS',?,0,NULL,?, ?, ?)",
+                (mid, revision, mode, expected_version, len(plan),
+                 json.dumps({"crash_fired": 0, "from_revision": from_revision,
+                             "requests": sorted({p[0] for p in plan})}),
+                 ts, ts))
+            for rid0, item, action in plan:
+                self.store.conn.execute(
+                    "INSERT INTO policy_migration_items(migration_id, item_id,"
+                    " request_id, service, record_id, action, state, detail,"
+                    " updated_at) VALUES(?,?,?,?,?,?,'PENDING',NULL,?)",
+                    (mid, item["id"], rid0, item["service"],
+                     item["record_id"], action, ts))
+            self.store.migration_event(mid, "MIGRATION_STARTED", {
+                "revision": revision, "mode": mode,
+                "subjects": subjects, "planned": len(plan),
+                "expected_version": expected_version,
+                "from_revision": from_revision})
+            self.store.commit()
+        # 缓存目标修订快照，供恢复后 RESTRICT 重发使用
+        self._rev_rules[revision] = rev["rules"]
+        # 登记后立即尝试执行（也可由下一 tick 恢复执行；崩溃后纯靠 tick 恢复）
+        self._run_migration(mid)
+        return self.store.migration_view(mid)
+
+    def _build_plan(self, target: int, mode: str,
+                    subjects: list[str] | None, rules: list[dict],
+                    from_revision: int | None = None) -> list[tuple]:
+        plan: list[tuple] = []
+        rows = self.store.conn.execute(
+            "SELECT * FROM requests WHERE status IN ('RESOLVING','IN_PROGRESS','CONFIRMED')"
+        ).fetchall()
+        for r in rows:
+            req = dict(r)
+            in_scope = subjects is None or req["subject_id"] in subjects
+            if not in_scope:
+                continue
+            for item in self.store.list_items(req["id"]):
+                if item["record_id"] is None:
+                    continue  # 身份解析前的占位项不迁移
+                item_rev = int(item["policy_revision"])
+                # 仅迁移条目当前绑定的修订：
+                #  canary/activate：低于目标修订的在途条目；
+                #  rollback：恰好绑定在被撤回修订上的条目（部分金丝雀也覆盖）。
+                if mode == "rollback":
+                    if item_rev != int(from_revision):
+                        continue
+                elif item_rev >= target:
+                    continue
+                action = self._plan_item_action(item, rules, target)
+                if action == "SKIP":
+                    continue
+                plan.append((req["id"], item, action))
+        plan.sort(key=lambda p: p[1]["id"])
+        return plan
+
+    def rollback_policy(self, target: int | None,
+                        expected_version: int | None) -> dict:
+        """回滚策略组件修订，并把受影响在途工作流迁移回恢复的修订。
+
+        ACTIVE 修订回滚 -> 恢复上一 SUPERSEDED 修订；
+        仅 CANARIED 的修订撤回 -> 金丝雀队列迁回当前 ACTIVE 修订。
+        """
+        result = policy_client.rollback(target, expected_version)
+        rolled_back = int(result["rolled_back"])
+        restored = result.get("restored")
+        subjects = result.get("canary_subjects")
+        if restored is None:
+            # 金丝雀撤回：目标修订 = 当前 ACTIVE
+            active = policy_client.get_active()
+            restored = int(active["revision"])
+            scope = subjects
+        else:
+            # 被回滚的是 ACTIVE -> 影响全部在途工作流
+            scope = None
+        view = self.apply_policy_revision(
+            int(restored), "rollback", scope, expected_version,
+            from_revision=rolled_back)
+        view["policy_rollback"] = result
+        return view
+
+    # -- 迁移执行（幂等 + 持久检查点恢复 + 乐观并发 CAS） -------------------
+    def _process_migrations(self):
+        with self.store.lock:
+            rows = self.store.conn.execute(
+                "SELECT id FROM policy_migrations WHERE state='IN_PROGRESS'"
+            ).fetchall()
+            ids = [r["id"] for r in rows]
+        for mid in ids:
+            try:
+                self._run_migration(mid)
+            except Exception as e:
+                with self.store.lock:
+                    self.store.migration_event(mid, "MIGRATION_TICK_ERROR",
+                                               {"error": repr(e)})
+                    self.store.commit()
+
+    def _run_migration(self, mid: str):
+        with self.store.lock:
+            mig = self.store.get_migration(mid)
+            if not mig or mig["state"] != "IN_PROGRESS":
+                return
+            target = int(mig["revision"])
+            try:
+                rev = policy_client.get_revision(target)
+                rules = rev["rules"]
+                self._rev_rules[target] = rules
+            except policy_client.PolicyError as e:
+                if target in self._rev_rules:
+                    rules = self._rev_rules[target]
+                else:
+                    self.store.migration_event(mid, "MIGRATION_POLICY_UNAVAILABLE",
+                                               {"error": str(e.body)})
+                    self.store.commit()
+                    return
+            rows = self.store.list_migration_items(mid)
+            checkpoint = mig["last_item_id"]
+            applied_this_run = 0
+            for mi in rows:
+                # 从持久检查点之后恢复：已 DONE/SKIPPED 的行重放为纯空操作
+                if mi["state"] in ("DONE", "SKIPPED"):
+                    continue
+                item = self.store.get_item(mi["item_id"])
+                if not item:
+                    self._finish_item_row(mid, mi, "SKIPPED",
+                                          {"reason": "item gone"})
+                    continue
+                # 动态状态重算（覆盖 WAIT：PURGING 可能已到终态或回到 RESTRICTED）
+                action = self._plan_item_action(item, rules, target)
+                if action == "SKIP":
+                    self._finish_item_row(mid, mi, "SKIPPED",
+                                          {"reason": self._skip_reason(item),
+                                           "from": item["status"]})
+                    self._advance_checkpoint(mid, mi["item_id"])
+                    continue
+                if action == "WAIT":
+                    continue  # 等擦除中条目自然到终态，下轮再评估
+                try:
+                    self._execute_item_migration(mid, mi, item, action, target,
+                                                 rules)
+                except MigrationTransient as e:
+                    # 瞬态失败：不推进检查点，下轮以同一幂等命令重试
+                    self.store.migration_event(mid, "MIGRATION_ITEM_RETRY", {
+                        "item_id": item["id"], "action": action,
+                        "error": str(e)})
+                    self.store.commit()
+                    return
+                self._advance_checkpoint(mid, mi["item_id"])
+                applied_this_run += 1
+                # 崩溃注入：检查点已落盘后退出，重启必须从检查点续跑。
+                # 阈值仅存于进程内存（非持久）：重启进程 _crash_after=0，
+                # 会凭持久检查点完成剩余项而不会再次崩溃。
+                if self._crash_after and applied_this_run >= self._crash_after:
+                    self.store.migration_event(mid, "MIGRATION_CRASH_INJECTED",
+                                               {"checkpoint": mi["item_id"]})
+                    self.store.commit()
+                    print(f"[engine] migration crash injection after checkpoint"
+                          f" {mi['item_id']}; exiting", flush=True)
+                    os._exit(1)
+            pending = self.store.conn.execute(
+                "SELECT COUNT(*) c FROM policy_migration_items"
+                " WHERE migration_id=? AND state='PENDING'", (mid,)).fetchone()
+            if pending["c"]:
+                self.store.commit()
+                return
+            self._complete_migration(mid, target, rules)
+
+    def _execute_item_migration(self, mid: str, mi: dict, item: dict,
+                                action: str, target: int, rules: list[dict]):
+        rid0 = item["request_id"]
+        svc = self.registry.get(item["service"])
+        ts = now_ms()
+        ver = int(item["policy_version"])
+        if action == "REBIND":
+            fields = ["policy_revision=?", "policy_version=policy_version+1",
+                      "updated_at=?"]
+            vals = [target, ts]
+            if item["status"] in ("DISPATCHED", "ERROR"):
+                # 作废旧阶段命令并重置计划：下轮 RESTRICT 用新修订快照重新下发，
+                # 旧命令的迟到回调会在修订围栏处被拒绝
+                fields += ["status='PENDING'", "active_command_id=NULL",
+                           "next_attempt_at=0",
+                           "command_id_restrict=?",
+                           "attempts=attempts"]
+                vals += [f"cmd_{uuid.uuid4().hex[:12]}"]
+            cur = self.store.conn.execute(
+                f"UPDATE items SET {', '.join(fields)} WHERE id=?"
+                " AND policy_version=?", (*vals, item["id"], ver))
+            if cur.rowcount == 0:
+                raise MigrationTransient(
+                    f"cas conflict on {item['id']}: expected version {ver}")
+            self.store.event(rid0, "POLICY_REBOUND", {
+                "service": item["service"], "record_id": item["record_id"],
+                "to_revision": target})
+            self.store.migration_event(mid, "MIGRATION_ITEM_APPLIED", {
+                "item_id": item["id"], "action": "REBIND",
+                "to_revision": target, "from_status": item["status"]})
+            self._finish_item_row(mid, mi, "DONE", {"to_revision": target})
+            self.store.commit()
+            return
+
+        if action == "SEAL":
+            command_id = f"cmd_seal_{uuid.uuid4().hex[:12]}"
+            payload = {
+                "command_id": command_id, "request_id": rid0,
+                "subject_id": item["subject_id"], "record_id": item["record_id"],
+                "op": "SEAL", "policy_revision": target, "rules": rules,
+                "callback_url": f"{self.callback_base}/internal/reports"}
+            try:
+                _, body = http_client.post(
+                    f"{svc['base_url']}/internal/commands", payload,
+                    svc["token"])
+            except http_client.ServiceError as e:
+                if e.status in (503, 0, 500, 502, 504):
+                    raise MigrationTransient(str(e.body))
+                raise
+            out_status = body.get("status")
+            if out_status in ("PURGED", "FAILED"):
+                # 迟到擦除已在服务侧落地：迁移收敛跳过，绝不重建数据；
+                # 服务拒绝封存（如记录状态冲突）：保留原样，记为受保护跳过
+                self.store.migration_event(mid, "MIGRATION_ITEM_LOST_RACE"
+                    if out_status == "PURGED" else "MIGRATION_ITEM_PRESERVED", {
+                    "item_id": item["id"], "outcome": body.get("status"),
+                    "error": body.get("error"),
+                    "note": "migration seal not applied; item preserved"})
+                self._finish_item_row(mid, mi, "SKIPPED",
+                                      {"reason": body.get("error")
+                                       or "already PURGED",
+                                       "outcome": out_status})
+                self.store.commit()
+                return
+            self._cas_advance(item, ver, "SEALED", body, command_id, target,
+                              hold_origin=body.get("hold_origin", "POLICY"))
+            self.store.event(rid0, "POLICY_SEALED", {
+                "service": item["service"], "record_id": item["record_id"],
+                "to_revision": target, "hold_code": body.get("hold_code"),
+                "note": "新匹配 RESTRICTED 项在任何 PURGE 前完成封存"})
+            self.store.migration_event(mid, "MIGRATION_ITEM_APPLIED", {
+                "item_id": item["id"], "action": "SEAL",
+                "to_revision": target, "command_id": command_id,
+                "from_status": item["status"]})
+            self._finish_item_row(mid, mi, "DONE", {"to_revision": target,
+                                                    "command_id": command_id})
+            self.store.commit()
+            return
+
+        if action == "RELEASE":
+            command_id = f"cmd_release_{uuid.uuid4().hex[:12]}"
+            payload = {
+                "command_id": command_id, "request_id": rid0,
+                "subject_id": item["subject_id"], "record_id": item["record_id"],
+                "op": "RELEASE_HOLD", "policy_revision": target,
+                "rules": rules,
+                "callback_url": f"{self.callback_base}/internal/reports"}
+            try:
+                _, body = http_client.post(
+                    f"{svc['base_url']}/internal/commands", payload,
+                    svc["token"])
+            except http_client.ServiceError as e:
+                if e.status in (503, 0, 500, 502, 504):
+                    raise MigrationTransient(str(e.body))
+                raise
+            out_status = body.get("status")
+            if out_status == "PURGED":
+                self.store.migration_event(mid, "MIGRATION_ITEM_LOST_RACE", {
+                    "item_id": item["id"], "outcome": "already PURGED"})
+                self._finish_item_row(mid, mi, "SKIPPED",
+                                      {"reason": "already PURGED"})
+                self.store.commit()
+                return
+            if out_status == "SEALED":
+                # 服务侧保留并非 POLICY 来源（外部认证/本地）：不得解除，保持封存
+                self.store.migration_event(mid, "MIGRATION_ITEM_PRESERVED", {
+                    "item_id": item["id"], "hold_origin": body.get("hold_origin"),
+                    "note": "non-policy hold preserved; item not rewritten"})
+                self._finish_item_row(mid, mi, "SKIPPED", {
+                    "reason": f"hold origin {body.get('hold_origin')} preserved"})
+                self.store.commit()
+                return
+            # RESTRICTED：策略撤回，同一工作流解封续跑（无需重新申请）
+            self._cas_advance(item, ver, "RESTRICTED", body, command_id, target)
+            self.store.event(rid0, "HOLD_WITHDRAWN", {
+                "service": item["service"], "record_id": item["record_id"],
+                "released_hold": item.get("hold_code"),
+                "to_revision": target,
+                "note": "规则撤回：同一工作流自动续跑"})
+            self.store.migration_event(mid, "MIGRATION_ITEM_APPLIED", {
+                "item_id": item["id"], "action": "RELEASE",
+                "to_revision": target, "command_id": command_id,
+                "from_status": "SEALED"})
+            self._finish_item_row(mid, mi, "DONE", {"to_revision": target,
+                                                    "command_id": command_id})
+            self.store.commit()
+            return
+
+    def _cas_advance(self, item: dict, expected_ver: int, status: str,
+                     body: dict, command_id: str, target_rev: int,
+                     hold_origin: str | None = None):
+        """乐观并发推进：版本不匹配时抛错，调用方不提交任何变更。"""
+        ts = now_ms()
+        sets = ["status=?", "result_hash=?", "evidence=?",
+                "policy_revision=?", "policy_version=policy_version+1",
+                "active_command_id=?", "updated_at=?"]
+        vals = [status, body.get("result_hash"),
+                json.dumps(body, ensure_ascii=False, sort_keys=True),
+                target_rev, command_id, ts]
+        if status == "SEALED":
+            sets += ["hold_code=?", "hold_reason=?", "hold_releases_at=?",
+                     "hold_origin=?"]
+            vals += [body.get("hold_code"), body.get("hold_reason"),
+                     body.get("hold_releases_at"),
+                     hold_origin or body.get("hold_origin", "POLICY")]
+        else:
+            sets += ["hold_code=NULL", "hold_reason=NULL",
+                     "hold_releases_at=NULL", "hold_origin=NULL",
+                     "overdue=0", "next_attempt_at=0",
+                     # 撤回解封后续跑原 PURGE：作废旧 purge 命令，
+                     # 由 PURGE 闸门用新 command_id 重新开放（回调按命令幂等）
+                     "command_id_purge=NULL", "purge_due_ms=0"]
+        cur = self.store.conn.execute(
+            f"UPDATE items SET {', '.join(sets)} WHERE id=?"
+            " AND policy_version=?", (*vals, item["id"], expected_ver))
+        if cur.rowcount == 0:
+            raise MigrationTransient(
+                f"cas conflict on {item['id']}: expected version {expected_ver}")
+
+    def _finish_item_row(self, mid: str, mi: dict, state: str, detail: dict):
+        self.store.conn.execute(
+            "UPDATE policy_migration_items SET state=?, detail=?, updated_at=?"
+            " WHERE migration_id=? AND item_id=?",
+            (state, json.dumps(detail, ensure_ascii=False), now_ms(),
+             mid, mi["item_id"]))
+
+    def _advance_checkpoint(self, mid: str, item_id: str):
+        self.store.conn.execute(
+            "UPDATE policy_migrations SET last_item_id=?,"
+            " done=(SELECT COUNT(*) FROM policy_migration_items"
+            " WHERE migration_id=? AND state IN ('DONE','SKIPPED')),"
+            " updated_at=? WHERE id=?",
+            (item_id, mid, now_ms(), mid))
+
+    def _complete_migration(self, mid: str, target: int, rules: list[dict]):
+        mig = self.store.get_migration(mid)
+        affected = sorted({mi["request_id"]
+                           for mi in self.store.list_migration_items(mid)
+                           if mi["state"] in ("DONE", "SKIPPED")})
+        for rid0 in affected:
+            req = self.store.get_request(rid0)
+            if not req:
+                continue
+            items = self.store.list_items(rid0)
+            revs = [int(i["policy_revision"]) for i in items
+                    if i["status"] != "CANCELLED"]
+            # 工作流级修订 = 全部存活条目达到的最高公共修订；
+            # PURGED/外部封存条目保留旧修订值（历史不可改写），故取最小值。
+            req_rev = min(revs) if revs else target
+            self.store.conn.execute(
+                "UPDATE requests SET policy_revision=?, updated_at=? WHERE id=?",
+                (req_rev, now_ms(), rid0))
+            binding = self.store.get_binding(rid0)
+            if binding:
+                # 绑定快照推进到目标修订；旧快照仍由证书/事件中的叶子证据保留
+                self.store.put_binding(
+                    rid0, req["subject_id"], req_rev,
+                    rules if req_rev == target else binding["rules"],
+                    None, mig["mode"] == "canary")
+        self.store.conn.execute(
+            "UPDATE policy_migrations SET state='COMPLETED', updated_at=? WHERE id=?",
+            (now_ms(), mid))
+        self.store.migration_event(mid, "MIGRATION_COMPLETED", {
+            "revision": target, "requests": affected})
+        self.store.commit()
+
+
+class PolicyApplyError(Exception):
+    def __init__(self, message: str, detail: dict):
+        self.detail = detail
+        super().__init__(message)
+
+
+class MigrationTransient(Exception):
+    pass
