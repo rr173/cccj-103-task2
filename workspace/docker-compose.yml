@@ -1,0 +1,112 @@
+# 跨服务数据删除协调：一键启动 + 容器启动验证
+#   docker compose up coordinator orders billing profile   # 运行系统
+#   docker compose run --rm verifier                        # 独立验证
+# 或整体：
+#   docker compose up --build --abort-on-container-exit verifier
+services:
+  coordinator:
+    build: .
+    image: deletion-coordinator:local
+    command: ["python3", "-m", "coordinator.app"]
+    environment:
+      COORDINATOR_DB: /data/coordinator.db
+      COORDINATOR_PORT: "8080"
+      CALLBACK_BASE: http://coordinator:8080
+      INTERNAL_TOKEN: dev-internal-token
+      ADMIN_TOKEN: dev-admin-token
+      DELETION_SIGNING_SECRET: dev-deletion-secret
+      GLOBAL_TOMBSTONE_SECRET: dev-tombstone-secret
+      RESTRICT_SLA_SECONDS: "8"
+      PURGE_SLA_SECONDS: "8"
+      REQUEST_TTL_SECONDS: "120"
+      SERVICES_JSON: |
+        [
+          {"name": "orders",  "base_url": "http://orders:9101"},
+          {"name": "billing", "base_url": "http://billing:9102"},
+          {"name": "profile", "base_url": "http://profile:9103"}
+        ]
+    ports:
+      - "8080:8080"
+    volumes:
+      - coord-data:/data
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=3).status==200 else 1)"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  orders:
+    image: deletion-coordinator:local
+    command: ["python3", "-m", "services.mock_service"]
+    environment:
+      SERVICE_NAME: orders
+      SERVICE_PORT: "9101"
+      SERVICE_DB: /data/orders.db
+      INTERNAL_TOKEN: dev-internal-token
+      ADMIN_TOKEN: dev-admin-token
+      GLOBAL_TOMBSTONE_SECRET: dev-tombstone-secret
+    volumes:
+      - orders-data:/data
+
+  billing:
+    image: deletion-coordinator:local
+    command: ["python3", "-m", "services.mock_service"]
+    environment:
+      SERVICE_NAME: billing
+      SERVICE_PORT: "9101"
+      SERVICE_DB: /data/billing.db
+      INTERNAL_TOKEN: dev-internal-token
+      ADMIN_TOKEN: dev-admin-token
+      GLOBAL_TOMBSTONE_SECRET: dev-tombstone-secret
+      # 法律/财务留存：inv-1 默认封存，保留期 6 秒后自动解除（演示用）
+      HOLD_RECORDS: "inv-1"
+      HOLD_CODE: LEGAL_HOLD
+      HOLD_REASON: "legal/financial retention"
+      HOLD_SECONDS: "6"
+    volumes:
+      - billing-data:/data
+
+  profile:
+    image: deletion-coordinator:local
+    command: ["python3", "-m", "services.mock_service"]
+    environment:
+      SERVICE_NAME: profile
+      SERVICE_PORT: "9101"
+      SERVICE_DB: /data/profile.db
+      INTERNAL_TOKEN: dev-internal-token
+      ADMIN_TOKEN: dev-admin-token
+      GLOBAL_TOMBSTONE_SECRET: dev-tombstone-secret
+    volumes:
+      - profile-data:/data
+
+  # 独立验证容器：不挂载任何内部数据卷，仅通过对外/内部 API 黑盒证明。
+  # 退出码 0 = 启动验证通过。
+  verifier:
+    image: deletion-coordinator:local
+    command: ["python3", "-m", "tests.verifier"]
+    depends_on:
+      coordinator:
+        condition: service_healthy
+      orders:
+        condition: service_started
+      billing:
+        condition: service_started
+      profile:
+        condition: service_started
+    environment:
+      COORD_URL: http://coordinator:8080
+      ORDERS_URL: http://orders:9101
+      BILLING_URL: http://billing:9101
+      PROFILE_URL: http://profile:9101
+      INTERNAL_TOKEN: dev-internal-token
+      ADMIN_TOKEN: dev-admin-token
+      DELETION_SIGNING_SECRET: dev-deletion-secret
+      GLOBAL_TOMBSTONE_SECRET: dev-tombstone-secret
+    restart: ""
+
+volumes:
+  coord-data:
+  orders-data:
+  billing-data:
+  profile-data:
