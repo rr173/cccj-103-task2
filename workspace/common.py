@@ -56,7 +56,8 @@ def evidence_leaf(item: dict) -> str:
     """单个计划项的证据叶子。
 
     item 需含：service, subject_id, record_id, status, result_hash,
-               hold_code(可空), command_id, updated_at
+               hold_code(可空), command_id, updated_at；
+               policy_revision 为该工作流绑定的**不可变策略修订**（默认 0）。
     验证方只需这些字段即可独立复算叶子，不依赖协调端数据库。
     """
     leaf_body = {
@@ -67,6 +68,7 @@ def evidence_leaf(item: dict) -> str:
         "result_hash": item.get("result_hash"),
         "hold_code": item.get("hold_code"),
         "command_id": item.get("command_id"),
+        "policy_revision": item.get("policy_revision", 0),
         "updated_at": item["updated_at"],
     }
     return sha256_hex(canonical(leaf_body))
@@ -95,3 +97,25 @@ def tombstone_token(request_id: str, subject_id: str) -> str:
 
 def verify_tombstone_token(request_id: str, subject_id: str, token: str) -> bool:
     return hmac.compare_digest(tombstone_token(request_id, subject_id), token or "")
+
+
+# -- 合规策略（法律保留 / 财务留存）版本化原语 ------------------------------
+# 修订版本内容不可变：规则集 + 金丝雀主体集合的哈希即其身份，
+# 协调端拉取后只按哈希缓存，重复拉取必须逐字节一致，否则视为篡改。
+def policy_content_hash(rules: list[dict], canary_subjects: list[str]) -> str:
+    body = {"canary_subjects": sorted(canary_subjects or []), "rules": rules or []}
+    return sha256_hex(canonical(body))
+
+
+def policy_rule_matches(rule: dict, service: str | None,
+                        record_id: str | None) -> bool:
+    """规则匹配：service / record_id 精确匹配 + record_prefix 前缀匹配。"""
+    m = rule.get("match") or {}
+    if m.get("service") and m["service"] != service:
+        return False
+    if m.get("record_id") and m["record_id"] != record_id:
+        return False
+    if m.get("record_prefix") and not (record_id or "").startswith(
+            m["record_prefix"]):
+        return False
+    return True

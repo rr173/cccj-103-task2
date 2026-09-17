@@ -4,10 +4,12 @@ from __future__ import annotations
 import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from common import iso, now_ms, verify_signature
-from coordinator.engine import INTERNAL_TOKEN, Engine, load_registry
+from coordinator import policy_client
+from coordinator.engine import INTERNAL_TOKEN, POLICY_URL, Engine, load_registry
+from coordinator.policy_manager import PolicyConflict
 from coordinator.store import Store
 
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "dev-admin-token")
@@ -36,6 +38,8 @@ def _item_view(i: dict) -> dict:
         "last_error": i["last_error"],
         "command_id_restrict": i["command_id_restrict"],
         "command_id_purge": i["command_id_purge"],
+        "policy_revision": i["policy_revision"],
+        "sealed_rule_id": i["sealed_rule_id"],
         "updated_at": iso(i["updated_at"]),
     }
 
@@ -52,6 +56,7 @@ def _request_view(rid: str) -> dict | None:
         "deadline": iso(req["deadline_ms"]),
         "expired": now_ms() > req["deadline_ms"],
         "cert_version": req["cert_version"],
+        "policy_revision": req["policy_revision"],
         "created_at": iso(req["created_at"]),
         "updated_at": iso(req["updated_at"]),
         "items": [_item_view(i) for i in req["items"]],
@@ -81,12 +86,14 @@ def _raw_view(req: dict) -> dict:
         "status": req["status"],
         "deadline_ms": req["deadline_ms"],
         "cert_version": req["cert_version"],
+        "policy_revision": req["policy_revision"],
         "items": [
             {"service": i["service"], "subject_id": i["subject_id"],
              "record_id": i["record_id"], "status": i["status"],
              "result_hash": i["result_hash"], "hold_code": i["hold_code"],
              "command_id_restrict": i["command_id_restrict"],
              "command_id_purge": i["command_id_purge"],
+             "policy_revision": i["policy_revision"],
              "updated_at": i["updated_at"],
              "evidence": _json.loads(i["evidence"]) if i["evidence"] else None}
             for i in req["items"]],
@@ -152,6 +159,50 @@ class Handler(BaseHTTPRequestHandler):
                 if not req0:
                     return self._json(404, {"error": "not found"})
                 return self._json(200, _raw_view(req0))
+            if p == "/policy/revisions":
+                if not self._auth(ADMIN_TOKEN):
+                    return self._json(401, {"error": "unauthorized"})
+                return self._json(200, {"revisions": store.list_policy_revisions()})
+            if len(parts) == 3 and parts[:2] == ["policy", "revisions"]:
+                if not self._auth(ADMIN_TOKEN):
+                    return self._json(401, {"error": "unauthorized"})
+                rev = None
+                try:
+                    rev = engine.policy.get_revision(int(parts[2]))
+                except Exception as e:
+                    return self._json(502, {"error": repr(e)})
+                return self._json(200 if rev else 404, rev or {"error": "not found"})
+            if p == "/policy/current":
+                if not self._auth(INTERNAL_TOKEN):
+                    return self._json(401, {"error": "unauthorized"})
+                try:
+                    s, b = policy_client.get(f"{POLICY_URL}/current", INTERNAL_TOKEN)
+                    return self._json(s, b)
+                except policy_client.PolicyUnavailable as e:
+                    return self._json(503, {"error": "policy unreachable",
+                                            "detail": str(e)})
+            if p == "/policy/dry-run":
+                if not self._auth(ADMIN_TOKEN):
+                    return self._json(401, {"error": "unauthorized"})
+                q = parse_qs(urlparse(self.path).query)
+                try:
+                    rev = int(q["revision"][0])
+                    action = q.get("action", ["CANARY"])[0]
+                except (KeyError, ValueError):
+                    return self._json(400, {"error": "?revision=N&action=... required"})
+                try:
+                    return self._json(200, engine.policy.dry_run(rev, action))
+                except Exception as e:
+                    return self._json(502, {"error": repr(e)})
+            if p == "/migrations":
+                if not self._auth(ADMIN_TOKEN):
+                    return self._json(401, {"error": "unauthorized"})
+                return self._json(200, {"migrations": engine.policy.list_migrations()})
+            if len(parts) == 2 and parts[0] == "migrations":
+                if not self._auth(ADMIN_TOKEN):
+                    return self._json(401, {"error": "unauthorized"})
+                mv = engine.policy.migration_view(parts[1])
+                return self._json(200 if mv else 404, mv or {"error": "not found"})
             return self._json(404, {"error": "not found", "path": p})
         except Exception as e:
             return self._json(500, {"error": repr(e)})
@@ -190,9 +241,78 @@ class Handler(BaseHTTPRequestHandler):
                     store.event(rid, f"ENGINE_{parts[3].upper()}D", {})
                     store.commit()
                 return self._json(200, {"request_id": rid, "engine_paused": bool(val)})
+            if p == "/policy/apply":
+                return self._apply_revision()
+            if p == "/admin/fault":
+                if not self._auth(ADMIN_TOKEN):
+                    return self._json(401, {"error": "unauthorized"})
+                body = self._body()
+                mode = body.get("mode", "")
+                on = bool(body.get("on", True))
+                if mode == "purge_paused":
+                    engine.purge_paused = on
+                    if not on:
+                        # 同时解除所有持久化在迁移行上的“停在某项前”钩子
+                        with store.lock:
+                            store.conn.execute(
+                                "UPDATE migrations SET pause_after_item=NULL"
+                                " WHERE status='RUNNING'")
+                            store.commit()
+                elif mode == "migration_crash":
+                    # 下一个迁移 checkpoint 落库后立即崩溃（崩溃恢复场景）
+                    engine.policy.crash_after_step = on
+                elif mode == "crash":
+                    engine.crash_after_tick = True
+                    return self._json(202, {"ok": True, "crash_armed": True})
+                elif mode == "clear":
+                    engine.purge_paused = False
+                    engine.crash_after_tick = False
+                    engine.policy.crash_after_step = False
+                    with store.lock:
+                        store.conn.execute(
+                            "UPDATE migrations SET pause_after_item=NULL"
+                            " WHERE status='RUNNING'")
+                        store.commit()
+                else:
+                    return self._json(400, {"error": f"unknown mode {mode}"})
+                return self._json(200, {"ok": True,
+                                        "purge_paused": engine.purge_paused,
+                                        "migration_crash":
+                                            engine.policy.crash_after_step})
             return self._json(404, {"error": "not found", "path": p})
         except Exception as e:
             return self._json(500, {"error": repr(e)})
+
+    def _apply_revision(self):
+        if not self._auth(ADMIN_TOKEN):
+            return self._json(401, {"error": "unauthorized"})
+        body = self._body()
+        try:
+            rev = int(body["revision"])
+        except (KeyError, ValueError, TypeError):
+            return self._json(400, {"error": "revision (int) required"})
+        action = (body.get("action") or "CANARY").upper()
+        if action not in ("CANARY", "ACTIVATE", "WITHDRAW", "ROLLBACK"):
+            return self._json(400, {"error": "invalid action"})
+        exp = body.get("expected_version")
+        try:
+            mv = engine.policy.apply_revision(
+                rev, action, body.get("idempotency_key"),
+                int(exp) if exp is not None else None,
+                pause_after_item=body.get("pause_after_item"),
+                source_revision=(int(body["source_revision"])
+                                 if body.get("source_revision") is not None
+                                 else None))
+        except PolicyConflict as c:
+            # 诊断性 409：迁移行都没写，所有项原子地保持原样
+            return self._json(409, {
+                "error": "version_conflict",
+                "message": str(c), "expected_version": c.expected,
+                "server_head": c.head, "server_active": c.active,
+                "diagnostic": "optimistic concurrency guard: no items touched"})
+        except Exception as e:
+            return self._json(502, {"error": repr(e)})
+        return self._json(202, mv)
 
     def _verify(self, rid: str):
         """独立复算入口（测试用 verifier 不依赖该接口，自行复算）。"""
@@ -220,14 +340,15 @@ class Handler(BaseHTTPRequestHandler):
             if not it:
                 leaf_ok = False
                 continue
+            raw_it = store.get_item(f"{rid}:{it['service']}:{it['record_id']}")
             body = {
                 "service": it["service"], "subject_id": it["subject_id"],
                 "record_id": it["record_id"], "status": it["status"],
                 "result_hash": it["result_hash"],
                 "hold_code": it["hold"]["code"] if it["hold"] else None,
                 "command_id": it["command_id_purge"] or it["command_id_restrict"],
-                "updated_at": store.get_item(
-                    f"{rid}:{it['service']}:{it['record_id']}")["updated_at"],
+                "policy_revision": raw_it["policy_revision"],
+                "updated_at": raw_it["updated_at"],
             }
             if evidence_leaf(body) != leaf["hash"]:
                 leaf_ok = False

@@ -4,6 +4,7 @@ FROM python:3.11-slim
 WORKDIR /app
 COPY common.py ./
 COPY coordinator/ ./coordinator/
+COPY policy/ ./policy/
 COPY services/ ./services/
 COPY tests/ ./tests/
 COPY scripts/ ./scripts/

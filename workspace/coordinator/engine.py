@@ -23,6 +23,7 @@ import time
 import uuid
 
 from . import http_client
+from .policy_manager import PolicyConflict, PolicyManager
 from .store import SEALED_LIKE, STATUS_RANK, TERMINAL, Store
 from common import (
     evidence_leaf,
@@ -44,6 +45,7 @@ HOLD_CHECK_MS = int(os.environ.get("HOLD_CHECK_MS", "1000"))
 TICK_MS = float(os.environ.get("ENGINE_TICK_MS", "0.3"))
 
 INTERNAL_TOKEN = os.environ.get("INTERNAL_TOKEN", "dev-internal-token")
+POLICY_URL = os.environ.get("POLICY_URL", "http://127.0.0.1:8090")
 
 DEFAULT_REGISTRY = [
     {"name": "orders", "base_url": "http://127.0.0.1:9101"},
@@ -75,6 +77,14 @@ class Engine:
         self._stop = threading.Event()
         self._pause_after_resolve: set[str] = set()
         self.thread: threading.Thread | None = None
+        # 版本化合规策略控制面
+        self.policy = PolicyManager(store, self.registry, POLICY_URL,
+                                    INTERNAL_TOKEN, callback_base)
+        self._policy_sync_at = 0.0
+        # 确定性故障钩子（仅 admin 注入；生产环境管理面鉴权关闭）
+        self.purge_paused = False
+        self.crash_after_tick = False
+        self._tick_count = 0
 
     # -- 生命周期 ----------------------------------------------------------
     def start(self):
@@ -99,30 +109,53 @@ class Engine:
         ts = now_ms()
         if pause_after_resolve:
             self._pause_after_resolve.add(rid)
+        # 每个工作流在创建瞬间绑定一个**不可变策略修订**：
+        # 金丝雀主体命中 CANARY 修订，对照主体绑定当前 ACTIVE。
+        try:
+            self.policy.sync_from_control_plane()
+        except Exception:
+            pass
+        bound = self.policy.effective_revision(subject_id)
+        bound_rev = bound["version"]
         with self.store.lock:
             self.store.conn.execute(
                 "INSERT INTO requests(id, subject_id, display_name, status, deadline_ms,"
-                " created_at, updated_at) VALUES(?,?,?,?,?,?,?)",
-                (rid, subject_id, display_name, "RESOLVING", ts + REQUEST_TTL_MS, ts, ts),
+                " policy_revision, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                (rid, subject_id, display_name, "RESOLVING", ts + REQUEST_TTL_MS,
+                 bound_rev, ts, ts),
             )
             for svc in self.registry:
                 iid = f"{rid}:{svc}:PENDING"
                 self.store.conn.execute(
                     "INSERT INTO items(id, request_id, service, subject_id, status,"
-                    " next_attempt_at, created_at, updated_at)"
-                    " VALUES(?,?,?,?,?,?,?,?)",
-                    (iid, rid, svc, subject_id, "PENDING", ts, ts, ts),
+                    " policy_revision, next_attempt_at, created_at, updated_at)"
+                    " VALUES(?,?,?,?,?,?,?,?,?)",
+                    (iid, rid, svc, subject_id, "PENDING", bound_rev, ts, ts, ts),
                 )
             self.store.event(rid, "REQUEST_CREATED", {
                 "subject_id": subject_id, "display_name": display_name,
                 "deadline": iso(ts + REQUEST_TTL_MS),
                 "services": list(self.registry),
+                "policy_revision": bound_rev,
+                "policy_state": bound.get("state"),
+                "bound_rules": [r["id"] for r in bound.get("rules", [])],
             })
             self.store.commit()
         return self.store.get_request(rid)
 
     # -- 主循环 ------------------------------------------------------------
     def tick(self):
+        # 1) 同步不可变策略修订（控制面失联则继续使用已缓存修订 / 基线 rev0）
+        if self._tick_count % 5 == 0:
+            try:
+                self.policy.sync_from_control_plane()
+            except Exception as e:
+                print(f"[engine] policy sync error: {e!r}")
+        # 2) 续跑所有 RUNNING 迁移（崩溃恢复 / 竞争裁决后继续 / 暂停钩子恢复）
+        try:
+            self.policy.run_due()
+        except Exception as e:
+            print(f"[engine] migration resume error: {e!r}")
         for req in self.store.active_requests():
             rid = req["id"]
             if req["engine_paused"]:
@@ -134,6 +167,11 @@ class Engine:
                     # 单请求处理失败不影响其他请求；落审计后下轮重试
                     self.store.event(rid, "TICK_ERROR", {"error": repr(e)})
                     self.store.commit()
+        self._tick_count += 1
+        if self.crash_after_tick:
+            # 故障注入：模拟协调端在迁移/编排中途崩溃（不提交任何内存态）。
+            print("[engine] injected crash firing; exiting process NOW")
+            os._exit(77)
 
     def _process_request(self, rid: str):
         req = self.store.get_request(rid)
@@ -172,9 +210,14 @@ class Engine:
             self._poll_missing_callbacks(rid, items)
             self._check_sealed_holds(rid, items)
             items = self.store.list_items(rid)
+            # 合规策略强制：项已绑定修订中的规则在 PURGE 前生效
+            # （保证“新匹配的 RESTRICTED 项先 SEALED，再谈 PURGE”）。
+            self._enforce_policy(rid, items)
+            items = self.store.list_items(rid)
             self._open_purge_gate(rid, items)
             items = self.store.list_items(rid)
-            self._dispatch_purge(rid, items)
+            if not self.purge_paused:
+                self._dispatch_purge(rid, items)
             items = self.store.list_items(rid)
             self._mark_overdue(rid, items)
             items = self.store.list_items(rid)
@@ -188,6 +231,7 @@ class Engine:
     # -- 阶段 0：跨服务身份解析 --------------------------------------------
     def _resolve(self, rid: str, items: list[dict]):
         ts = now_ms()
+        req = self.store.get_request(rid)
         # 只处理占位项（record_id 尚未确定）；解析成功后该项被真实计划项替换，
         # 必须从本轮待处理集合移除，避免同 tick 重复插入触发唯一约束。
         pending = [i for i in items if i["status"] == "PENDING"
@@ -208,10 +252,10 @@ class Engine:
                     nid = f"{rid}:{item['service']}:NONE"
                     self.store.conn.execute(
                         "INSERT INTO items(id, request_id, service, subject_id, record_id,"
-                        " status, next_attempt_at, created_at, updated_at)"
-                        " VALUES(?,?,?,?,?,?,?,?,?)",
+                        " status, policy_revision, next_attempt_at, created_at, updated_at)"
+                        " VALUES(?,?,?,?,?,?,?,?,?,?)",
                         (nid, rid, item["service"], item["subject_id"], None,
-                         "CANCELLED", 0, ts, ts))
+                         "CANCELLED", req["policy_revision"], 0, ts, ts))
                     self.store.event(rid, "IDENTITY_RESOLVED",
                                      {"service": item["service"], "records": []})
                 else:
@@ -219,13 +263,16 @@ class Engine:
                         nid = f"{rid}:{item['service']}:{rec['record_id']}"
                         self.store.conn.execute(
                             "INSERT INTO items(id, request_id, service, subject_id,"
-                            " record_id, status, command_id_restrict, next_attempt_at,"
-                            " created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                            " record_id, status, command_id_restrict, policy_revision,"
+                            " next_attempt_at, created_at, updated_at)"
+                            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                             (nid, rid, item["service"], item["subject_id"],
                              rec["record_id"], "PENDING",
-                             f"cmd_{uuid.uuid4().hex[:12]}", ts, ts, ts))
+                             f"cmd_{uuid.uuid4().hex[:12]}",
+                             req["policy_revision"], ts, ts, ts))
                     self.store.event(rid, "IDENTITY_RESOLVED", {
-                        "service": item["service"], "records": records})
+                        "service": item["service"], "records": records,
+                        "policy_revision": req["policy_revision"]})
                 # 关键：解析结果立即提交，后续 tick 才能看到真实计划项
                 self.store.commit()
             except http_client.ServiceError as e:
@@ -322,6 +369,18 @@ class Engine:
                 pass
 
     # -- PURGE 闸门：所有非空计划项 RESTRICTED/SEALED 后才开放 -------------
+    def _enforce_policy(self, rid: str, items: list[dict]):
+        for item in items:
+            # 终态 / CANCELLED / 未解析占位项不强制
+            if item["status"] in TERMINAL or item["record_id"] is None:
+                continue
+            try:
+                self.policy.enforce_on_item(item)
+            except Exception as e:
+                self.store.event(rid, "POLICY_ENFORCE_ERROR", {
+                    "service": item["service"], "record_id": item["record_id"],
+                    "error": repr(e)})
+
     def _open_purge_gate(self, rid: str, items: list[dict]):
         actionable = [i for i in items if i["status"] != "CANCELLED"]
         if not actionable:
@@ -333,6 +392,8 @@ class Engine:
         ts = now_ms()
         changed = False
         for item in actionable:
+            # 撤回/回退 RELEASE 会清空旧 PURGE 命令：闸门重新开放时签发新命令，
+            # 保证“同一工作流续跑”而不是复用已封存期的陈旧 command_id。
             if not item["command_id_purge"]:
                 self.store.conn.execute(
                     "UPDATE items SET command_id_purge=?, purge_due_ms=? WHERE id=?",
@@ -479,6 +540,8 @@ class Engine:
                 # 证据中绑定阶段命令：已进入擦除阶段则用 PURGE 命令，否则 RESTRICT
                 "command_id": item.get("command_id_purge")
                              or item.get("command_id_restrict"),
+                # 证据绑定该计划项的不可变策略修订（回滚也不重写历史证书）
+                "policy_revision": item.get("policy_revision", 0),
                 "updated_at": item["updated_at"],
             }
             leaves.append({"item": f"{item['service']}:{item.get('record_id')}",
@@ -620,6 +683,14 @@ class Engine:
                 self.store.event(rid, "REPORT_DUPLICATE", {
                     "service": item["service"], "record_id": item["record_id"],
                     "status": status, "via": via})
+                return
+            # 合规保护：已依法 SEALED 的项不得被迟到的 RESTRICTED 同级回报解封。
+            # 状态序中两者同级（rank 都是 2），必须显式守门，否则会丢掉封存。
+            if cur["status"] == "SEALED" and status == "RESTRICTED":
+                self.store.event(rid, "REPORT_REJECTED_AFTER_SEAL", {
+                    "service": item["service"], "record_id": item["record_id"],
+                    "current": "SEALED", "received": "RESTRICTED",
+                    "rule_id": cur["sealed_rule_id"], "via": via})
                 return
             # 乱序：不倒退
             if status in STATUS_RANK and STATUS_RANK[status] < STATUS_RANK[cur["status"]]:

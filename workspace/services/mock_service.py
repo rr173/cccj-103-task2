@@ -57,7 +57,8 @@ CREATE TABLE IF NOT EXISTS commands(
 CREATE TABLE IF NOT EXISTS holds(
   record_id TEXT PRIMARY KEY,
   code TEXT, reason TEXT, active INTEGER NOT NULL,
-  created_at INTEGER NOT NULL, releases_at INTEGER
+  created_at INTEGER NOT NULL, releases_at INTEGER,
+  rule_id TEXT
 );
 CREATE TABLE IF NOT EXISTS tombstones(
   subject_id TEXT PRIMARY KEY,
@@ -76,6 +77,10 @@ _lock = threading.RLock()
 _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 _conn.row_factory = sqlite3.Row
 _conn.executescript(SCHEMA)
+# 老卷平滑加列（holds.rule_id 用于版本化策略封存与内置保留并存）
+_cols = {r["name"] for r in _conn.execute("PRAGMA table_info(holds)").fetchall()}
+if "rule_id" not in _cols:
+    _conn.execute("ALTER TABLE holds ADD COLUMN rule_id TEXT")
 _conn.commit()
 
 
@@ -149,11 +154,79 @@ def ensure_hold(record_id: str):
     ts = now_ms()
     with _lock:
         db().execute(
-            "INSERT INTO holds(record_id, code, reason, active, created_at, releases_at)"
-            " VALUES(?,?,?,1,?,?)",
-            (record_id, HOLD_CODE, HOLD_REASON, ts, ts + HOLD_SECONDS * 1000))
+            "INSERT INTO holds(record_id, code, reason, active, created_at,"
+            " releases_at, rule_id) VALUES(?,?,?,1,?,?,?)",
+            (record_id, HOLD_CODE, HOLD_REASON, ts,
+             ts + HOLD_SECONDS * 1000, f"builtin:{HOLD_CODE}"))
         db().commit()
     return get_hold(record_id)
+
+
+def apply_policy_seal(record_id: str, rule_id: str, hold: str, reason: str,
+                      hold_seconds: int) -> dict:
+    """版本化策略的显式封存：幂等；已被擦除则返回 PURGED（竞争收敛）。"""
+    ts = now_ms()
+    with _lock:
+        rec = db().execute("SELECT * FROM records WHERE record_id=?",
+                           (record_id,)).fetchone()
+        if not rec:
+            return {"status": "PURGED", "service": SERVICE_NAME,
+                    "record_id": record_id,
+                    "note": "record already erased; cannot seal",
+                    "result_hash": result_hash(record_id, "PURGED")}
+        existing = get_hold(record_id)
+        if existing and existing["active"] \
+                and db().execute("SELECT status FROM records WHERE record_id=?",
+                                 (record_id,)).fetchone()["status"] == "SEALED":
+            return {"status": "SEALED", "service": SERVICE_NAME,
+                    "record_id": record_id, "subject_id": rec["subject_id"],
+                    "hold_code": existing["code"], "hold_reason": existing["reason"],
+                    "hold_releases_at": existing["releases_at"],
+                    "rule_id": existing["rule_id"], "replayed_hold": True,
+                    "result_hash": result_hash(record_id, "SEALED",
+                                               {"hold_code": existing["code"],
+                                                "rule_id": existing["rule_id"]})}
+        db().execute(
+            "INSERT INTO holds(record_id, code, reason, active, created_at,"
+            " releases_at, rule_id) VALUES(?,?,?,1,?,?,?)"
+            " ON CONFLICT(record_id) DO UPDATE SET code=excluded.code,"
+            " reason=excluded.reason, active=1, created_at=excluded.created_at,"
+            " releases_at=excluded.releases_at, rule_id=excluded.rule_id",
+            (record_id, hold, reason, ts, ts + hold_seconds * 1000, rule_id))
+        db().execute(
+            "UPDATE records SET status='SEALED', updated_at=? WHERE record_id=?",
+            (ts, record_id))
+        db().commit()
+        return {"status": "SEALED", "service": SERVICE_NAME,
+                "record_id": record_id, "subject_id": rec["subject_id"],
+                "hold_code": hold, "hold_reason": reason,
+                "hold_releases_at": ts + hold_seconds * 1000, "rule_id": rule_id,
+                "result_hash": result_hash(record_id, "SEALED",
+                                           {"hold_code": hold, "rule_id": rule_id})}
+
+
+def apply_policy_release(record_id: str, rule_id: str | None) -> dict:
+    """策略撤回/回退：解除封存，记录回到 RESTRICTED 以续跑同一工作流。"""
+    ts = now_ms()
+    with _lock:
+        rec = db().execute("SELECT * FROM records WHERE record_id=?",
+                           (record_id,)).fetchone()
+        if not rec:
+            return {"status": "PURGED", "service": SERVICE_NAME,
+                    "record_id": record_id,
+                    "note": "already absent",
+                    "result_hash": result_hash(record_id, "PURGED")}
+        h = get_hold(record_id)
+        db().execute("UPDATE holds SET active=0 WHERE record_id=?", (record_id,))
+        db().execute(
+            "UPDATE records SET status='RESTRICTED', updated_at=? WHERE record_id=?",
+            (ts, record_id))
+        db().commit()
+        return {"status": "RESTRICTED", "service": SERVICE_NAME,
+                "record_id": record_id, "subject_id": rec["subject_id"],
+                "rule_id": rule_id or (h["rule_id"] if h else None),
+                "result_hash": result_hash(record_id, "RESTRICTED",
+                                           {"released_rule": rule_id})}
 
 
 def store_command(command_id: str, request_id: str, record_id: str, op: str,
@@ -194,8 +267,12 @@ def execute_command(payload: dict) -> dict:
                            (record_id,)).fetchone()
         ts = now_ms()
 
-        # 命令执行前先看墓碑：已确认删除后任何命令都不能让数据复活
-        if rec and tombstone_exists(rec["subject_id"]) and op != "PURGE":
+        # 命令执行前先看墓碑：已确认删除后任何命令都不能让数据复活。
+        # 例外：SEAL/RELEASE 是合规策略对“依法封存但未擦除”记录的封存/解封，
+        # 记录此时仍然物理存在；RESTRICT/UNRESTRICT/PURGE 之外必须放行它们，
+        # 否则撤回/回滚无法让同一工作流续跑。
+        if rec and tombstone_exists(rec["subject_id"]) and op not in (
+                "PURGE", "SEAL", "RELEASE"):
             result = {"status": "FAILED",
                       "error": "tombstone blocks resurrected command",
                       "result_hash": result_hash(record_id, "FAILED")}
@@ -236,6 +313,32 @@ def execute_command(payload: dict) -> dict:
                       "result_hash": result_hash(record_id, "RESTRICTED")}
             return store_command(command_id, request_id, record_id, op,
                                  "RESTRICTED", result)
+
+        if op == "SEAL":
+            # 版本化合规策略：显式封存（法律保留/财务留存），命令幂等。
+            if not rec:
+                result = {"status": "PURGED", "service": SERVICE_NAME,
+                          "request_id": request_id, "record_id": record_id,
+                          "note": "record already erased; cannot seal",
+                          "result_hash": result_hash(record_id, "PURGED")}
+                return store_command(command_id, request_id, record_id, op,
+                                     "PURGED", result)
+            result = apply_policy_seal(
+                record_id, payload.get("rule_id", "policy-rule"),
+                payload.get("hold", "LEGAL_HOLD"),
+                payload.get("reason", "policy hold"),
+                int(payload.get("hold_seconds", 86400)))
+            result["request_id"] = request_id
+            out_status = result["status"]
+            return store_command(command_id, request_id, record_id, op,
+                                 out_status, result)
+
+        if op == "RELEASE":
+            # 策略撤回/回退：解除封存回到 RESTRICTED，由协调端续跑 PURGE。
+            result = apply_policy_release(record_id, payload.get("rule_id"))
+            result["request_id"] = request_id
+            return store_command(command_id, request_id, record_id, op,
+                                 result["status"], result)
 
         if op == "PURGE":
             if not rec:
@@ -353,6 +456,7 @@ class Handler(BaseHTTPRequestHandler):
                 active = bool(hold_active(parts[2]))
                 return self._json(200, {"record_id": parts[2], "active": active,
                                         "code": h["code"], "reason": h["reason"],
+                                        "rule_id": h["rule_id"],
                                         "releases_at": h["releases_at"]})
             if p == "/admin/quarantine":
                 rows = db().execute(

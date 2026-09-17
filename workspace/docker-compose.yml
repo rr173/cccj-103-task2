@@ -1,17 +1,39 @@
-# 跨服务数据删除协调：一键启动 + 容器启动验证
-#   docker compose up coordinator orders billing profile   # 运行系统
-#   docker compose run --rm verifier                        # 独立验证
+# 跨服务数据删除协调 + 版本化合规策略控制面：一键启动 + 容器启动验证
+#   docker compose up coordinator policy orders billing profile  # 运行系统
+#   docker compose run --rm verifier                             # 独立验证
 # 或整体：
 #   docker compose up --build --abort-on-container-exit verifier
 services:
-  coordinator:
+  policy:
     build: .
     image: deletion-coordinator:local
+    command: ["python3", "-m", "policy.service"]
+    environment:
+      POLICY_DB: /data/policy.db
+      POLICY_PORT: "8090"
+      INTERNAL_TOKEN: dev-internal-token
+      ADMIN_TOKEN: dev-admin-token
+      POLICY_ADMIN_TOKEN: dev-admin-token
+    volumes:
+      - policy-data:/data
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8090/health',timeout=3).status==200 else 1)"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  coordinator:
+    image: deletion-coordinator:local
     command: ["python3", "-m", "coordinator.app"]
+    depends_on:
+      policy:
+        condition: service_healthy
     environment:
       COORDINATOR_DB: /data/coordinator.db
       COORDINATOR_PORT: "8080"
       CALLBACK_BASE: http://coordinator:8080
+      POLICY_URL: http://policy:8090
       INTERNAL_TOKEN: dev-internal-token
       ADMIN_TOKEN: dev-admin-token
       DELETION_SIGNING_SECRET: dev-deletion-secret
@@ -22,13 +44,15 @@ services:
       SERVICES_JSON: |
         [
           {"name": "orders",  "base_url": "http://orders:9101"},
-          {"name": "billing", "base_url": "http://billing:9102"},
-          {"name": "profile", "base_url": "http://profile:9103"}
+          {"name": "billing", "base_url": "http://billing:9101"},
+          {"name": "profile", "base_url": "http://profile:9101"}
         ]
     ports:
       - "8080:8080"
     volumes:
       - coord-data:/data
+    # 崩溃恢复场景：协调端被注入崩溃后由守护策略自动重启，从持久 checkpoint 续跑
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "python3", "-c",
              "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=3).status==200 else 1)"]
@@ -86,6 +110,8 @@ services:
     image: deletion-coordinator:local
     command: ["python3", "-m", "tests.verifier"]
     depends_on:
+      policy:
+        condition: service_healthy
       coordinator:
         condition: service_healthy
       orders:
@@ -95,6 +121,7 @@ services:
       profile:
         condition: service_started
     environment:
+      POLICY_URL: http://policy:8090
       COORD_URL: http://coordinator:8080
       ORDERS_URL: http://orders:9101
       BILLING_URL: http://billing:9101
@@ -103,9 +130,12 @@ services:
       ADMIN_TOKEN: dev-admin-token
       DELETION_SIGNING_SECRET: dev-deletion-secret
       GLOBAL_TOMBSTONE_SECRET: dev-tombstone-secret
+      # 本地编排由 run_local.sh 监督重启；容器场景由 verifier 告知不要自行拉起进程
+      LOCAL_SUPERVISOR: "0"
     restart: ""
 
 volumes:
+  policy-data:
   coord-data:
   orders-data:
   billing-data:
